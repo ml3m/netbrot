@@ -52,7 +52,12 @@ impl Renderer {
         color_type: ColorType,
         render_type: RenderType,
     ) -> Self {
-        let ratio = (xlim.1 - xlim.0) / (ylim.1 - ylim.0);
+        let mut ratio = (xlim.1 - xlim.0) / (ylim.1 - ylim.0);
+        if ratio.is_nan() || ratio.is_infinite() {
+            ratio = 1.0;
+        }
+        // Clamp ratio to prevent generating ridiculously large textures that crash egui
+        let ratio = ratio.abs().clamp(0.01, 10.0);
         let r = resolution as f64;
 
         Renderer {

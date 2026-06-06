@@ -4,8 +4,11 @@ version = "2026.2.0"
 edition = "2024"
 
 [dependencies]
+bytemuck = "1.25.0"
 clap = { "version" = "4.5", "features" = ["derive"] }
 colors-transform = { "version" = "0.2" }
+egui = "0.34.3"
+glow = "0.17.0"
 image = { "version" = "0.25", "features" = ["png"] }
 indicatif = { "version" = "0.18", "features" = ["rayon"]}
 little_exif = { "version" = "0.6" }
@@ -15,5 +18,7 @@ num-traits = { "version" = "0.2" }
 rand = { "version" = "0.10" }
 rand_distr = { "version" = "0.6" }
 rayon = { "version" = "1.10" }
+rfd = "0.17.2"
 serde = { "version" = "1.0", "features" = ["derive"]}
 serde_json = { "version" = "1.0" }
+three-d = { version = "0.19.0", features = ["egui", "egui-gui"] }

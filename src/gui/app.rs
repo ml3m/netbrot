@@ -1,0 +1,577 @@
+use crate::iterate::Netbrot;
+use crate::colorschemes::ColorType;
+use crate::render::RenderType;
+use crate::gui::brot3d::{BrotParams, BrotMode, generate_points_gpu, generate_points_cpu};
+use crate::gui::point_cloud::{PointCloudGeometry, PointCloudMaterial};
+use crate::gui::render2d::render_image;
+use three_d::*;
+use egui::TextureHandle;
+use serde::{Serialize, Deserialize};
+use nalgebra::DMatrix;
+use num::complex::{c64, Complex64};
+use rand::Rng;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GenMatrixType {
+    Fixed,
+    Feedforward,
+    EqualRow,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Exhibit {
+    pub mat: DMatrix<Complex64>,
+    pub escape_radius: f64,
+    pub upper_left: Complex64,
+    pub lower_right: Complex64,
+}
+
+pub struct App {
+    pub netbrot: Netbrot,
+    pub render_type: RenderType,
+    pub color_type: ColorType,
+    pub period: u32,
+    pub eps: f64,
+    pub is_3d: bool,
+    pub brot_params: BrotParams,
+    pub use_gpu: bool,
+    
+    // 2D state
+    pub color_image_texture: Option<egui::TextureHandle>,
+    
+    pub gen_matrix_type: GenMatrixType,
+    pub gen_matrix_size: usize,
+    pub texture: Option<TextureHandle>,
+    pub resolution: usize,
+    pub iterations: usize,
+    pub escape_radius: f64,
+    pub bbox: (f64, f64, f64, f64),
+    
+    // 3D state
+    pub point_cloud: Option<PointCloudGeometry>,
+    pub material: PointCloudMaterial,
+    pub points_generated: bool,
+    
+    pub status_msg: Option<String>,
+    pub generation_pending: bool,
+    
+    // UI Panels
+    pub show_matrix_editor: bool,
+    pub show_view_controls: bool,
+    
+    // Matrix Editor
+    pub matrix_nx: usize,
+    pub matrix_ny: usize,
+    pub matrix_values: Vec<(f64, f64)>,
+    
+    pub context: Context,
+}
+
+impl App {
+    pub fn new(context: &Context) -> Self {
+        Self {
+            // A 1x1 identity matrix z_{n+1} = z_n^2 + c
+            netbrot: Netbrot::new(&DMatrix::from_element(1, 1, num::complex::c64(1.0, 0.0)), 100, 4.0),
+            render_type: RenderType::Mandelbrot,
+            color_type: ColorType::DefaultPalette,
+            period: 2,
+            eps: 1e-4,
+            is_3d: false,
+            brot_params: BrotParams::default(),
+            use_gpu: true,
+            
+            color_image_texture: None,
+            gen_matrix_type: GenMatrixType::Feedforward,
+            gen_matrix_size: 2,
+            texture: None,
+            resolution: 500,
+            iterations: 100,
+            escape_radius: 4.0,
+            bbox: (-2.5, 1.5, -1.5, 1.5),
+            
+            point_cloud: None,
+            material: PointCloudMaterial {
+                point_size: 1.0,
+                opacity: 0.15,
+                is_transparent: true,
+            },
+            points_generated: false,
+            
+            status_msg: Some("Generating 3D points...".to_string()),
+            generation_pending: true,
+            
+            show_matrix_editor: false,
+            show_view_controls: true,
+            
+            matrix_nx: 1,
+            matrix_ny: 1,
+            matrix_values: vec![(1.0, 0.0)],
+            
+            context: context.clone(),
+        }
+    }
+
+    pub fn draw_gui(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Netbrot");
+                ui.separator();
+                if ui.selectable_label(self.show_matrix_editor, "🧮 Matrix Editor").clicked() {
+                    self.show_matrix_editor = !self.show_matrix_editor;
+                }
+                if ui.selectable_label(self.show_view_controls, "👁 View Controls").clicked() {
+                    self.show_view_controls = !self.show_view_controls;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("📂 Load Exhibit JSON").clicked() {
+                        self.load_json_dialog();
+                    }
+                });
+            });
+        });
+
+        if self.show_matrix_editor {
+            egui::SidePanel::left("matrix_panel")
+                .resizable(true)
+                .width_range(150.0..=1000.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.draw_matrix_editor(ui);
+                        });
+                });
+        }
+
+        if self.show_view_controls {
+            egui::SidePanel::right("view_panel")
+                .resizable(true)
+                .width_range(150.0..=600.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.draw_view_controls(ui);
+                        });
+                });
+        }
+
+        let central_frame = if self.is_3d {
+            egui::Frame::none().fill(egui::Color32::TRANSPARENT)
+        } else {
+            egui::Frame::central_panel(&ctx.style())
+        };
+
+        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
+            if !self.is_3d {
+                if let Some(texture) = &self.texture {
+                    let available = ui.available_size();
+                    let aspect = texture.size()[0] as f32 / texture.size()[1] as f32;
+                    let size = if available.x / available.y > aspect {
+                        egui::vec2(available.y * aspect, available.y)
+                    } else {
+                        egui::vec2(available.x, available.x / aspect)
+                    };
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Configure matrix and generate, or load an exhibit JSON.");
+                    });
+                }
+            } else {
+                if !self.points_generated {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Click 'Generate 3D Points' to render.");
+                    });
+                }
+                // When in 3D, three-d will render to the background
+            }
+        });
+    }
+
+    pub fn draw_matrix_editor(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Matrix Editor");
+        ui.separator();
+        
+        egui::CollapsingHeader::new("Generate Random Matrix")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Type:");
+                    egui::ComboBox::from_id_source("gen_type")
+                        .selected_text(match self.gen_matrix_type {
+                            GenMatrixType::Fixed => "Fixed",
+                            GenMatrixType::Feedforward => "Feedforward",
+                            GenMatrixType::EqualRow => "EqualRow",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.gen_matrix_type, GenMatrixType::Fixed, "Fixed");
+                            ui.selectable_value(&mut self.gen_matrix_type, GenMatrixType::Feedforward, "Feedforward");
+                            ui.selectable_value(&mut self.gen_matrix_type, GenMatrixType::EqualRow, "EqualRow");
+                        });
+                });
+                ui.add(egui::Slider::new(&mut self.gen_matrix_size, 2..=10).text("Size"));
+                if ui.button("Generate & Apply").clicked() {
+                    self.generate_random_matrix();
+                }
+            });
+            
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            if ui.add(egui::DragValue::new(&mut self.matrix_nx).range(1..=10)).changed() {
+                self.matrix_ny = self.matrix_nx;
+                self.resize_matrix();
+            }
+            ui.label("Matrix Size (N x N)");
+        });
+        
+        ui.separator();
+        
+        egui::Grid::new("matrix_grid").striped(true).show(ui, |ui| {
+            for y in 0..self.matrix_ny {
+                for x in 0..self.matrix_nx {
+                    let idx = x * self.matrix_ny + y; // column major
+                    if idx < self.matrix_values.len() {
+                        let val = &mut self.matrix_values[idx];
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut val.0).speed(0.1));
+                            ui.label("+");
+                            ui.add(egui::DragValue::new(&mut val.1).speed(0.1));
+                            ui.label("i");
+                        });
+                    }
+                }
+                ui.end_row();
+            }
+        });
+        
+        ui.separator();
+        ui.heading("Bounds & Parameters");
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut self.bbox.0).speed(0.1));
+            ui.add(egui::DragValue::new(&mut self.bbox.1).speed(0.1));
+            ui.label("X Range");
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut self.bbox.2).speed(0.1));
+            ui.add(egui::DragValue::new(&mut self.bbox.3).speed(0.1));
+            ui.label("Y Range");
+        });
+        
+        ui.add(egui::DragValue::new(&mut self.escape_radius).speed(0.1).prefix("Escape Radius: "));
+        ui.add(egui::DragValue::new(&mut self.iterations).speed(1).prefix("Max Iterations: "));
+        ui.add(egui::DragValue::new(&mut self.resolution).speed(10).prefix("Resolution: "));
+        
+        ui.separator();
+        if ui.button("Apply & Generate 2D").clicked() {
+            let ctx = ui.ctx().clone();
+            self.apply_matrix_and_generate_2d(&ctx);
+        }
+    }
+
+    fn draw_view_controls(&mut self, ui: &mut egui::Ui) {
+        ui.heading("View Controls");
+        ui.separator();
+        
+        ui.checkbox(&mut self.is_3d, "3D Mode");
+        
+        egui::CollapsingHeader::new("2D Generation Settings")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Render Mode:");
+                    egui::ComboBox::from_id_source("render_mode")
+                        .selected_text(format!("{:?}", self.render_type))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.render_type, RenderType::Mandelbrot, "Mandelbrot");
+                            ui.selectable_value(&mut self.render_type, RenderType::Period, "Period");
+                            ui.selectable_value(&mut self.render_type, RenderType::Julia, "Julia");
+                            ui.selectable_value(&mut self.render_type, RenderType::Attractive, "Attractive Fixed Point");
+                        });
+                });
+                
+                ui.horizontal(|ui| {
+                    ui.label("Color Scheme:");
+                    egui::ComboBox::from_id_source("color_scheme")
+                        .selected_text(format!("{:?}", self.color_type))
+                        .show_ui(ui, |ui| {
+                            let types = [
+                                ColorType::DefaultPalette,
+                                ColorType::PeriodStack,
+                                ColorType::PeriodEndesga,
+                                ColorType::PeriodMatlab,
+                                ColorType::OrbitBlue,
+                                ColorType::OrbitFire,
+                            ];
+                            for t in types {
+                                ui.selectable_value(&mut self.color_type, t, format!("{:?}", t));
+                            }
+                        });
+                });
+                
+                if ui.button("Generate 2D").clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.apply_matrix_and_generate_2d(&ctx);
+                }
+            });
+            
+        egui::CollapsingHeader::new("3D Visualization Settings")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Mode:");
+                    egui::ComboBox::from_id_source("3d_mode")
+                        .selected_text(match self.brot_params.mode {
+                            BrotMode::Combined => "Combined",
+                            BrotMode::Bifurcation => "Bifurcation",
+                            BrotMode::WideAttractor => "Wide Attractor",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.brot_params.mode, BrotMode::Combined, "Combined");
+                            ui.selectable_value(&mut self.brot_params.mode, BrotMode::Bifurcation, "Bifurcation");
+                            ui.selectable_value(&mut self.brot_params.mode, BrotMode::WideAttractor, "Wide Attractor");
+                        });
+                });
+                
+                ui.add(egui::Slider::new(&mut self.brot_params.nx, 100..=10000).text("NX"));
+                ui.add(egui::Slider::new(&mut self.brot_params.warmup, 10..=2000).text("Warmup"));
+                ui.add(egui::Slider::new(&mut self.brot_params.keep, 10..=5000).text("Keep"));
+                
+                ui.checkbox(&mut self.use_gpu, "Use GPU Compute");
+                
+                ui.add(egui::Slider::new(&mut self.material.point_size, 0.1..=10.0).text("Point Size"));
+                ui.add(egui::Slider::new(&mut self.material.opacity, 0.005..=1.0).text("Opacity"));
+                
+                if ui.button("Generate 3D Points").clicked() {
+                    self.status_msg = Some("Generating 3D points...".to_string());
+                    self.generation_pending = true;
+                }
+                
+                if let Some(msg) = &self.status_msg {
+                    ui.label(msg);
+                }
+            });
+    }
+
+    pub fn check_pending_generation(&mut self, ctx: &egui::Context) {
+        if self.generation_pending {
+            self.generation_pending = false;
+            let start = std::time::Instant::now();
+            self.generate_3d();
+            let elapsed = start.elapsed();
+            self.status_msg = Some(format!("Done in {:.2}s", elapsed.as_secs_f32()));
+            ctx.request_repaint();
+        }
+    }
+
+    pub fn generate_3d(&mut self) {
+        // Sync 3D generator bounds with 2D bounds
+        self.brot_params.re_min = self.bbox.0 as f32;
+        self.brot_params.re_max = self.bbox.1 as f32;
+        self.brot_params.im_min = self.bbox.2 as f32;
+        self.brot_params.im_max = self.bbox.3 as f32;
+        self.brot_params.escape_r = self.escape_radius as f32;
+        
+        let (positions, colors) = if self.brot_params.mode == BrotMode::Combined {
+            let mut p1 = self.brot_params.clone();
+            p1.mode = BrotMode::Bifurcation;
+            p1.nx = 7000;
+            p1.ny = 1;
+            p1.warmup = 800;
+            p1.keep = 2000;
+
+            let mut p2 = self.brot_params.clone();
+            p2.mode = BrotMode::WideAttractor;
+            p2.nx = 900;
+            p2.ny = 700;
+            p2.warmup = 120;
+            p2.keep = 80;
+
+            let (mut pos1, mut col1) = if self.use_gpu {
+                match generate_points_gpu(&self.context, &p1, &self.netbrot.mat) {
+                    Ok(res) => res,
+                    Err(e) => { eprintln!("GPU err (p1): {}", e); (vec![], vec![]) }
+                }
+            } else {
+                generate_points_cpu(&p1, &self.netbrot.mat)
+            };
+
+            let (pos2, col2) = if self.use_gpu {
+                match generate_points_gpu(&self.context, &p2, &self.netbrot.mat) {
+                    Ok(res) => res,
+                    Err(e) => { eprintln!("GPU err (p2): {}", e); (vec![], vec![]) }
+                }
+            } else {
+                generate_points_cpu(&p2, &self.netbrot.mat)
+            };
+
+            eprintln!("Generated {} bifurcation points and {} wide attractor points.", pos1.len(), pos2.len());
+
+            pos1.extend(pos2);
+            col1.extend(col2);
+            (pos1, col1)
+        } else {
+            let res = if self.use_gpu {
+                match generate_points_gpu(&self.context, &self.brot_params, &self.netbrot.mat) {
+                    Ok(res) => res,
+                    Err(e) => { eprintln!("GPU err: {}", e); (vec![], vec![]) }
+                }
+            } else {
+                generate_points_cpu(&self.brot_params, &self.netbrot.mat)
+            };
+            eprintln!("Generated {} points.", res.0.len());
+            res
+        };
+        
+        if !positions.is_empty() {
+            let mut pc = PointCloudGeometry::new(&self.context);
+            pc.update(&positions, &colors);
+            self.point_cloud = Some(pc);
+            self.points_generated = true;
+        } else {
+            eprintln!("Error generating 3D points");
+        }
+    }
+    
+    pub fn generate_2d(&mut self, ctx: &egui::Context) {
+        let color_image = render_image(
+            self.render_type,
+            (self.resolution, self.resolution),
+            self.bbox,
+            &self.netbrot,
+            self.color_type,
+            self.period,
+            self.eps,
+        );
+        
+        self.texture = Some(ctx.load_texture("fractal", color_image, egui::TextureOptions::LINEAR));
+    }
+    
+    pub fn load_exhibit(&mut self, path: &std::path::Path) {
+        use std::fs::File;
+        
+        if let Ok(file) = File::open(path) {
+            if let Ok(exhibit) = serde_json::from_reader::<_, Exhibit>(file) {
+                self.netbrot = Netbrot::new(&exhibit.mat, 200, exhibit.escape_radius);
+                self.bbox = (exhibit.upper_left.re, exhibit.lower_right.re, exhibit.lower_right.im, exhibit.upper_left.im);
+                self.points_generated = false;
+                
+                // Update matrix editor state
+                self.matrix_nx = exhibit.mat.ncols();
+                self.matrix_ny = exhibit.mat.nrows();
+                self.matrix_values.clear();
+                for x in 0..self.matrix_nx {
+                    for y in 0..self.matrix_ny {
+                        let val = exhibit.mat[(y, x)];
+                        self.matrix_values.push((val.re, val.im));
+                    }
+                }
+                self.escape_radius = exhibit.escape_radius;
+            }
+        }
+    }
+    
+    pub fn load_json_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .pick_file() {
+            self.load_exhibit(&path);
+        }
+    }
+    
+    pub fn resize_matrix(&mut self) {
+        let expected_len = self.matrix_nx * self.matrix_ny;
+        self.matrix_values.resize(expected_len, (0.0, 0.0));
+    }
+    
+    pub fn apply_matrix_and_generate_2d(&mut self, ctx: &egui::Context) {
+        let mut mat = DMatrix::zeros(self.matrix_ny, self.matrix_nx);
+        for y in 0..self.matrix_ny {
+            for x in 0..self.matrix_nx {
+                let idx = x * self.matrix_ny + y;
+                if idx < self.matrix_values.len() {
+                    let val = self.matrix_values[idx];
+                    mat[(y, x)] = num::complex::c64(val.0, val.1);
+                }
+            }
+        }
+        self.netbrot = Netbrot::new(&mat, self.iterations, self.escape_radius);
+        self.points_generated = false;
+        self.generate_2d(ctx);
+    }
+    
+    pub fn generate_random_matrix(&mut self) {
+        let size = self.gen_matrix_size;
+        
+        let mut mat = DMatrix::zeros(size, size);
+        
+        match self.gen_matrix_type {
+            GenMatrixType::Fixed => {
+                // Just fallback to the default 2x2
+                self.gen_matrix_size = 2;
+                mat = DMatrix::zeros(2, 2);
+                mat[(0, 0)] = c64(1.0, 0.0);
+                mat[(0, 1)] = c64(0.8, 0.0);
+                mat[(1, 0)] = c64(1.0, 0.0);
+                mat[(1, 1)] = c64(-0.5, 0.0);
+            }
+            GenMatrixType::Feedforward => {
+                for y in 0..size {
+                    for x in 0..size {
+                        if x <= y {
+                            let val: f64 = rand::random::<f64>();
+                            mat[(y, x)] = c64(val, 0.0);
+                        }
+                    }
+                }
+            }
+            GenMatrixType::EqualRow => {
+                for y in 0..size {
+                    for x in 0..size {
+                        let val: f64 = rand::random::<f64>();
+                        mat[(y, x)] = c64(val, 0.0);
+                    }
+                }
+                
+                let mut row_sums = Vec::new();
+                for y in 0..size {
+                    let mut sum = 0.0;
+                    for x in 0..size {
+                        sum += mat[(y, x)].re;
+                    }
+                    row_sums.push(sum);
+                }
+                
+                let target_sum = row_sums[0];
+                for y in 0..size {
+                    let scale = target_sum / row_sums[y];
+                    for x in 0..size {
+                        mat[(y, x)] *= scale;
+                    }
+                }
+            }
+        }
+        
+        // Estimate escape radius using SVD
+        let svd = nalgebra::linalg::SVD::new(mat.clone(), true, true);
+        let min_sigma = svd.singular_values.min();
+        let escape_radius = 2.0 * (self.gen_matrix_size as f64).sqrt() / (min_sigma * min_sigma);
+        // Clamp to a reasonable value
+        let escape_radius = escape_radius.min(10.0);
+        
+        // Update App state
+        self.matrix_nx = self.gen_matrix_size;
+        self.matrix_ny = self.gen_matrix_size;
+        self.matrix_values.clear();
+        for x in 0..self.matrix_nx {
+            for y in 0..self.matrix_ny {
+                let val = mat[(y, x)];
+                self.matrix_values.push((val.re, val.im));
+            }
+        }
+        self.escape_radius = escape_radius;
+        self.points_generated = false;
+        self.netbrot = Netbrot::new(&mat, self.iterations, self.escape_radius);
+    }
+}
