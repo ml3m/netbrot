@@ -1,7 +1,10 @@
 use crate::iterate::Netbrot;
 use crate::colorschemes::ColorType;
 use crate::render::RenderType;
-use crate::gui::brot3d::{BrotParams, BrotMode, generate_points_gpu, generate_points_cpu};
+use crate::gui::brot3d::{
+    BrotMode, BrotParams, combined_pass_params, generate_points_cpu, generate_points_gpu,
+    subsample_points,
+};
 use crate::gui::point_cloud::{PointCloudGeometry, PointCloudMaterial};
 use crate::gui::render2d::render_image;
 use three_d::*;
@@ -70,7 +73,8 @@ pub struct App {
     pub point_cloud: Option<PointCloudGeometry>,
     pub material: PointCloudMaterial,
     pub points_generated: bool,
-    
+    pub max_display_points: usize,
+
     pub status_msg: Option<String>,
     pub generation_pending: bool,
     
@@ -117,14 +121,15 @@ impl App {
             
             point_cloud: None,
             material: PointCloudMaterial {
-                point_size: 1.0,
-                opacity: 0.15,
+                point_size: 0.8,
+                opacity: 1.0,
                 is_transparent: true,
             },
             points_generated: false,
-            
-            status_msg: Some("Generating 3D points...".to_string()),
-            generation_pending: true,
+            max_display_points: 500_000,
+
+            status_msg: None,
+            generation_pending: false,
             
             show_matrix_editor: false,
             show_view_controls: true,
@@ -488,10 +493,20 @@ impl App {
                 });
                 
                 ui.add(egui::Slider::new(&mut self.brot_params.nx, 100..=10000).text("NX"));
+                ui.add(egui::Slider::new(&mut self.brot_params.ny, 50..=2000).text("NY (wide)"));
                 ui.add(egui::Slider::new(&mut self.brot_params.warmup, 10..=2000).text("Warmup"));
                 ui.add(egui::Slider::new(&mut self.brot_params.keep, 10..=5000).text("Keep"));
-                
+                ui.add(
+                    egui::Slider::new(&mut self.max_display_points, 50_000..=2_000_000)
+                        .logarithmic(true)
+                        .text("Max display points"),
+                );
+
                 ui.checkbox(&mut self.use_gpu, "Use GPU Compute");
+                ui.label(
+                    "Each bounded c-path records up to Keep orbit points. \
+                     Combined ≈ NX×Keep + (NX/4)×(NY/2)×min(Keep,100).",
+                );
                 
                 ui.add(egui::Slider::new(&mut self.material.point_size, 0.1..=10.0).text("Point Size"));
                 ui.add(egui::Slider::new(&mut self.material.opacity, 0.005..=1.0).text("Opacity"));
@@ -519,71 +534,66 @@ impl App {
     }
 
     pub fn generate_3d(&mut self) {
-        // Sync 3D generator bounds with 2D bounds
         self.brot_params.re_min = self.bbox.0 as f32;
         self.brot_params.re_max = self.bbox.1 as f32;
         self.brot_params.im_min = self.bbox.2 as f32;
         self.brot_params.im_max = self.bbox.3 as f32;
         self.brot_params.escape_r = self.escape_radius as f32;
-        
-        let (positions, colors) = if self.brot_params.mode == BrotMode::Combined {
-            let mut p1 = self.brot_params.clone();
-            p1.mode = BrotMode::Bifurcation;
-            p1.nx = 7000;
-            p1.ny = 1;
-            p1.warmup = 800;
-            p1.keep = 2000;
 
-            let mut p2 = self.brot_params.clone();
-            p2.mode = BrotMode::WideAttractor;
-            p2.nx = 900;
-            p2.ny = 700;
-            p2.warmup = 120;
-            p2.keep = 80;
-
-            let (mut pos1, mut col1) = if self.use_gpu {
-                match generate_points_gpu(&self.context, &p1, &self.netbrot.mat) {
+        let generate = |params: &BrotParams| -> (Vec<Vec3>, Vec<Srgba>) {
+            if self.use_gpu {
+                match generate_points_gpu(&self.context, params, &self.netbrot.mat) {
                     Ok(res) => res,
-                    Err(e) => { eprintln!("GPU err (p1): {}", e); (vec![], vec![]) }
+                    Err(e) => {
+                        eprintln!("GPU err: {e}");
+                        generate_points_cpu(params, &self.netbrot.mat)
+                    }
                 }
             } else {
-                generate_points_cpu(&p1, &self.netbrot.mat)
-            };
-
-            let (pos2, col2) = if self.use_gpu {
-                match generate_points_gpu(&self.context, &p2, &self.netbrot.mat) {
-                    Ok(res) => res,
-                    Err(e) => { eprintln!("GPU err (p2): {}", e); (vec![], vec![]) }
-                }
-            } else {
-                generate_points_cpu(&p2, &self.netbrot.mat)
-            };
-
-            eprintln!("Generated {} bifurcation points and {} wide attractor points.", pos1.len(), pos2.len());
-
-            pos1.extend(pos2);
-            col1.extend(col2);
-            (pos1, col1)
-        } else {
-            let res = if self.use_gpu {
-                match generate_points_gpu(&self.context, &self.brot_params, &self.netbrot.mat) {
-                    Ok(res) => res,
-                    Err(e) => { eprintln!("GPU err: {}", e); (vec![], vec![]) }
-                }
-            } else {
-                generate_points_cpu(&self.brot_params, &self.netbrot.mat)
-            };
-            eprintln!("Generated {} points.", res.0.len());
-            res
+                generate_points_cpu(params, &self.netbrot.mat)
+            }
         };
-        
-        if !positions.is_empty() {
-            let mut pc = PointCloudGeometry::new(&self.context);
-            pc.update(&positions, &colors);
-            self.point_cloud = Some(pc);
-            self.points_generated = true;
+
+        let (mut positions, mut colors, detail) = if self.brot_params.mode == BrotMode::Combined {
+            let (p1, p2) = combined_pass_params(&self.brot_params);
+            let (pos1, col1) = generate(&p1);
+            let (pos2, col2) = generate(&p2);
+            let n1 = pos1.len();
+            let n2 = pos2.len();
+            let mut pos = pos1;
+            let mut col = col1;
+            pos.extend(pos2);
+            col.extend(col2);
+            (
+                pos,
+                col,
+                format!("{n1} bifurcation + {n2} wide"),
+            )
         } else {
-            eprintln!("Error generating 3D points");
+            let (pos, col) = generate(&self.brot_params);
+            let n = pos.len();
+            (pos, col, format!("{n} total"))
+        };
+
+        let raw_count = positions.len();
+        (positions, colors) = subsample_points(positions, colors, self.max_display_points);
+        let shown = positions.len();
+
+        if !positions.is_empty() {
+            if let Some(pc) = self.point_cloud.as_mut() {
+                pc.update(&positions, &colors);
+            } else {
+                let mut pc = PointCloudGeometry::new(&self.context);
+                pc.update(&positions, &colors);
+                self.point_cloud = Some(pc);
+            }
+            self.points_generated = true;
+            self.status_msg = Some(format!(
+                "Showing {shown} points ({detail}; raw {raw_count}, cap {})",
+                self.max_display_points,
+            ));
+        } else {
+            self.status_msg = Some("No bounded orbits found for these parameters.".to_string());
         }
     }
     

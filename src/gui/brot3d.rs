@@ -30,10 +30,12 @@ impl Default for BrotParams {
     fn default() -> Self {
         Self {
             mode: BrotMode::Combined,
-            nx: 7000,
-            ny: 1,
-            warmup: 800,
-            keep: 2000,
+            // Interactive defaults — the old Python HQ values (nx=7000, keep=2000)
+            // produce tens of millions of points and are not suitable for realtime GL.
+            nx: 2000,
+            ny: 400,
+            warmup: 400,
+            keep: 800,
             escape_r: 2.0,
             re_min: -2.5,
             re_max: 0.55,
@@ -41,6 +43,44 @@ impl Default for BrotParams {
             im_max: 1.15,
         }
     }
+}
+
+/// Split Combined mode into a bifurcation slice + a lighter wide-attractor shell.
+pub fn combined_pass_params(base: &BrotParams) -> (BrotParams, BrotParams) {
+    let mut bifurcation = base.clone();
+    bifurcation.mode = BrotMode::Bifurcation;
+    bifurcation.ny = 1;
+
+    let mut wide = base.clone();
+    wide.mode = BrotMode::WideAttractor;
+    wide.nx = (base.nx / 4).clamp(200, 1000);
+    wide.ny = (base.ny / 2).clamp(80, 400);
+    wide.warmup = base.warmup.min(200);
+    wide.keep = base.keep.min(100);
+
+    (bifurcation, wide)
+}
+
+/// Downsample before upload — drawing 10M+ GL points per frame will always lag.
+pub fn subsample_points(
+    positions: Vec<Vec3>,
+    colors: Vec<Srgba>,
+    max_points: usize,
+) -> (Vec<Vec3>, Vec<Srgba>) {
+    let n = positions.len();
+    if n <= max_points {
+        return (positions, colors);
+    }
+    let stride = n.div_ceil(max_points);
+    let mut pos = Vec::with_capacity(max_points);
+    let mut col = Vec::with_capacity(max_points);
+    let mut i = 0;
+    while i < n && pos.len() < max_points {
+        pos.push(positions[i]);
+        col.push(colors[i]);
+        i += stride;
+    }
+    (pos, col)
 }
 
 // Colormaps matching Python's matplotlib
