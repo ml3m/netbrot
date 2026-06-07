@@ -203,6 +203,12 @@ impl App {
                     if ui.button("📂 Load Exhibit JSON").clicked() {
                         self.load_json_dialog();
                     }
+                    if ui.button("💾 Save Exhibit JSON").clicked() {
+                        self.save_json_dialog();
+                    }
+                    if ui.button("🖼 Save Picture (HQ)").clicked() {
+                        self.save_high_quality();
+                    }
                 });
             });
         });
@@ -676,6 +682,22 @@ impl App {
             .add_filter("JSON", &["json"])
             .pick_file() {
             self.load_exhibit(&path);
+        }
+    }
+    
+    pub fn save_json_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .save_file() {
+            let exhibit = Exhibit {
+                mat: self.netbrot.mat.clone(),
+                escape_radius: self.escape_radius,
+                upper_left: num::complex::c64(self.bbox.0, self.bbox.3),
+                lower_right: num::complex::c64(self.bbox.1, self.bbox.2),
+            };
+            if let Ok(file) = std::fs::File::create(&path) {
+                let _ = serde_json::to_writer_pretty(file, &exhibit);
+            }
         }
     }
     
