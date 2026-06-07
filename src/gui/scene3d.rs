@@ -17,6 +17,8 @@ pub struct PointCloudLayer {
     pub material: PointCloudMaterial,
     pub visible: bool,
     pub count: usize,
+    pub cpu_positions: Vec<Vec3>,
+    pub cpu_colors: Vec<three_d::Srgba>,
 }
 
 /// Visual indicator linking a c-value between the 2D and 3D views.

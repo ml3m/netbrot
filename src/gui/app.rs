@@ -105,6 +105,13 @@ pub struct App {
     pub matrix_values: Vec<(f64, f64)>,
     
     pub context: Context,
+
+    // New 3D Visualization features
+    pub background_color: egui::Color32,
+    pub orthographic: bool,
+    pub axes_enabled: bool,
+    pub grid_enabled: bool,
+    pub auto_rotate: bool,
 }
 
 impl App {
@@ -164,6 +171,13 @@ impl App {
             matrix_values: vec![(1.0, 0.0)],
             
             context: context.clone(),
+
+            // New 3D Visualization features
+            background_color: egui::Color32::from_rgb(13, 13, 18),
+            orthographic: false,
+            axes_enabled: false,
+            grid_enabled: false,
+            auto_rotate: false,
         };
         
         let (tx, rx_thread) = channel::<RenderRequest>();
@@ -623,6 +637,48 @@ impl App {
                 );
                 ui.label("Ray emphasis enlarges and brightens points far from z = 0.");
 
+                ui.separator();
+                ui.heading("Environment & Tools");
+
+                ui.horizontal(|ui| {
+                    ui.label("Background:");
+                    ui.color_edit_button_srgba(&mut self.background_color);
+                });
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.orthographic, "Orthographic Camera");
+                    ui.checkbox(&mut self.auto_rotate, "Auto-Rotate");
+                });
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.axes_enabled, "Show Axes");
+                    ui.checkbox(&mut self.grid_enabled, "Show Grid");
+                });
+
+                ui.collapsing("Clipping Planes", |ui| {
+                    ui.add(egui::Slider::new(&mut self.scene.clip.re_min, -10.0..=0.0).text("Min X"));
+                    ui.add(egui::Slider::new(&mut self.scene.clip.re_max, 0.0..=10.0).text("Max X"));
+                    ui.add(egui::Slider::new(&mut self.scene.clip.im_min, -10.0..=0.0).text("Min Y"));
+                    ui.add(egui::Slider::new(&mut self.scene.clip.im_max, 0.0..=10.0).text("Max Y"));
+                    ui.add(egui::Slider::new(&mut self.scene.clip.z_min, -10.0..=0.0).text("Min Z"));
+                    ui.add(egui::Slider::new(&mut self.scene.clip.z_max, 0.0..=10.0).text("Max Z"));
+                });
+
+                ui.separator();
+                if ui.button("Export to PLY").clicked() {
+                    // Start export
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PLY format", &["ply"])
+                        .save_file()
+                    {
+                        if let Err(e) = crate::gui::export::export_to_ply(&path, &self.scene) {
+                            self.status_msg = Some(format!("Export failed: {}", e));
+                        } else {
+                            self.status_msg = Some("Export successful!".to_string());
+                        }
+                    }
+                }
+
                 // Color mode
                 ui.horizontal(|ui| {
                     ui.label("Color Mode:");
@@ -823,6 +879,8 @@ impl App {
         if let Some(layer) = layer_slot {
             layer.geometry.update(&positions, &colors);
             layer.count = count;
+            layer.cpu_positions = positions;
+            layer.cpu_colors = colors;
         } else {
             let mut geom = PointCloudGeometry::new(&self.context);
             geom.update(&positions, &colors);
@@ -839,6 +897,8 @@ impl App {
                 },
                 visible: true,
                 count,
+                cpu_positions: positions,
+                cpu_colors: colors,
             });
         }
     }

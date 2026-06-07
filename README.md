@@ -4,6 +4,7 @@
 [![Build Status](https://github.com/alexfikl/netbrot/actions/workflows/ci.yml/badge.svg)](https://github.com/alexfikl/netbrot/actions/workflows/ci.yml)
 [![Zenodo repository](https://zenodo.org/badge/DOI/10.5281/zenodo.15573719.svg)](https://doi.org/10.5281/zenodo.15573719)
 [![Windows Executable](https://img.shields.io/badge/Windows-Executable_(Nightly)-orange)](https://github.com/alexfikl/netbrot/releases/download/nightly/netbrot.exe)
+![project showcase gif](docs/record_fractal.gif)
 
 This repository contains some experiments for vector Mandelbrot sets. We look
 at the map

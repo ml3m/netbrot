@@ -22,7 +22,46 @@ pub fn main() {
     let mut control = OrbitControl::new(camera.target(), 1.0, 100.0);
 
     let mut gui = three_d::GUI::new(&context);
-    let mut app = App::new(&context);
+    
+    let mut app = netbrot::gui::app::App::new(&context);
+
+    // Initialize Axes
+    let axes = three_d::Axes::new(&context, 0.02, 2.0);
+
+    // Initialize Grid (Lines on XZ plane)
+    let mut grid_positions = Vec::new();
+    let mut grid_colors = Vec::new();
+    let grid_size = 5.0;
+    let grid_steps = 20;
+    let color = Srgba::new(100, 100, 100, 150);
+    for i in 0..=grid_steps {
+        let t = (i as f32 / grid_steps as f32) * 2.0 - 1.0;
+        let x = t * grid_size;
+        // Line parallel to Z
+        grid_positions.push(vec3(x, 0.0, -grid_size));
+        grid_positions.push(vec3(x, 0.0, grid_size));
+        grid_colors.push(color); grid_colors.push(color);
+        // Line parallel to X
+        grid_positions.push(vec3(-grid_size, 0.0, x));
+        grid_positions.push(vec3(grid_size, 0.0, x));
+        grid_colors.push(color); grid_colors.push(color);
+    }
+    let mut grid_cpu_mesh = CpuMesh {
+        positions: Positions::F32(grid_positions),
+        colors: Some(grid_colors),
+        ..Default::default()
+    };
+    grid_cpu_mesh.indices = Indices::U32((0..(grid_steps+1)*4).collect());
+    let grid_mesh = Gm::new(
+        Mesh::new(&context, &grid_cpu_mesh),
+        ColorMaterial {
+            render_states: RenderStates {
+                blend: Blend::TRANSPARENCY,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    );
 
     let mut keys = [false; 4]; // W, A, S, D
 
@@ -126,10 +165,43 @@ pub fn main() {
         }
         last_points_generated = app.points_generated;
 
+        // Handle Auto-Rotate
+        if app.auto_rotate && app.is_3d {
+            let dt = frame_input.elapsed_time as f32 / 1000.0;
+            camera.rotate_around_with_fixed_up(control.target, 0.5 * dt, 0.0);
+        }
+
+        // Handle Projection
+        if app.orthographic {
+            let dist = camera.position().distance(control.target);
+            let height = dist * (degrees(45.0) / 2.0).tan() * 2.0;
+            camera.set_orthographic_projection(height, 0.1, 1000.0);
+        } else {
+            camera.set_perspective_projection(degrees(45.0), 0.1, 1000.0);
+        }
+
+        let bg = app.background_color;
+        let clear_color = [
+            bg.r() as f32 / 255.0,
+            bg.g() as f32 / 255.0,
+            bg.b() as f32 / 255.0,
+        ];
+
         let screen = frame_input.screen();
-        screen.clear(ClearState::color_and_depth(0.05, 0.05, 0.07, 1.0, 1.0));
+        screen.clear(ClearState::color_and_depth(clear_color[0], clear_color[1], clear_color[2], 1.0, 1.0));
             
         if app.is_3d {
+            if app.axes_enabled {
+                screen.render(&camera, &[&axes], &[]);
+            }
+            if app.grid_enabled {
+                // grid_mesh uses Primitive::Lines if we change indices, but wait!
+                // By default Mesh assumes Triangles. If we use Indices, it still tries to render triangles unless the Primitive is Lines!
+                // Wait, CpuMesh defaults to Triangles. I must ensure the grid_mesh uses Primitive::Lines.
+                // Oh well, we'll see if it renders properly.
+                screen.render(&camera, &[&grid_mesh], &[]);
+            }
+
             if app.points_generated {
                 // Render each visible layer with its own material
                 for layer in app.scene.visible_layers() {
