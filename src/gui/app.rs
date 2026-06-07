@@ -61,6 +61,7 @@ pub struct App {
     pub iterations: usize,
     pub escape_radius: f64,
     pub bbox: (f64, f64, f64, f64),
+    pub zoom_sensitivity: f32,
     
     // 3D state
     pub point_cloud: Option<PointCloudGeometry>,
@@ -106,6 +107,7 @@ impl App {
             iterations: 100,
             escape_radius: 4.0,
             bbox: (-2.5, 1.5, -1.5, 1.5),
+            zoom_sensitivity: 1.0,
             
             point_cloud: None,
             material: PointCloudMaterial {
@@ -256,7 +258,8 @@ impl App {
                     
                     let scroll = ui.input(|i| i.smooth_scroll_delta);
                     if response.hovered() && scroll.y != 0.0 {
-                        let zoom_factor = if scroll.y > 0.0 { 0.8 } else { 1.25 };
+                        let diff = (0.2 * self.zoom_sensitivity).clamp(0.01, 0.9) as f64;
+                        let zoom_factor = if scroll.y > 0.0 { 1.0 - diff } else { 1.0 + diff };
                         
                         let pointer_pos = response.hover_pos().unwrap_or(response.rect.center());
                         let x_rel = (pointer_pos.x - response.rect.left()) as f64 / size.x as f64;
@@ -414,6 +417,8 @@ impl App {
                             }
                         });
                 });
+                
+                ui.add(egui::Slider::new(&mut self.zoom_sensitivity, 0.1..=5.0).text("Zoom Sensitivity"));
                 
                 ui.horizontal(|ui| {
                     if ui.button("Generate 2D").clicked() {
