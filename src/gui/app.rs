@@ -52,7 +52,7 @@ pub struct App {
     // 2D state
     pub color_image_texture: Option<egui::TextureHandle>,
     pub render_tx: Option<Sender<RenderRequest>>,
-    pub render_rx: Option<Receiver<egui::ColorImage>>,
+    pub render_rx: Option<Receiver<(egui::ColorImage, (f64, f64, f64, f64))>>,
     
     pub gen_matrix_type: GenMatrixType,
     pub gen_matrix_size: usize,
@@ -61,7 +61,10 @@ pub struct App {
     pub iterations: usize,
     pub escape_radius: f64,
     pub bbox: (f64, f64, f64, f64),
+    pub render_bbox: (f64, f64, f64, f64),
     pub zoom_sensitivity: f32,
+    pub last_interaction_time: Option<std::time::Instant>,
+    pub pending_render_request: bool,
     
     // 3D state
     pub point_cloud: Option<PointCloudGeometry>,
@@ -107,7 +110,10 @@ impl App {
             iterations: 100,
             escape_radius: 4.0,
             bbox: (-2.5, 1.5, -1.5, 1.5),
+            render_bbox: (-2.5, 1.5, -1.5, 1.5),
             zoom_sensitivity: 1.0,
+            last_interaction_time: None,
+            pending_render_request: false,
             
             point_cloud: None,
             material: PointCloudMaterial {
@@ -131,7 +137,7 @@ impl App {
         };
         
         let (tx, rx_thread) = channel::<RenderRequest>();
-        let (tx_thread, rx) = channel::<egui::ColorImage>();
+        let (tx_thread, rx) = channel::<(egui::ColorImage, (f64, f64, f64, f64))>();
         
         thread::spawn(move || {
             let mut current_params: Option<RenderRequest> = None;
@@ -157,7 +163,7 @@ impl App {
                         params.period,
                         params.eps,
                     );
-                    let _ = tx_thread.send(image);
+                    let _ = tx_thread.send((image, params.bbox));
                     if let Some(ctx) = params.egui_ctx {
                         ctx.request_repaint();
                     }
@@ -172,6 +178,17 @@ impl App {
     }
 
     pub fn draw_gui(&mut self, ctx: &egui::Context) {
+        if self.pending_render_request {
+            if let Some(last_time) = self.last_interaction_time {
+                if last_time.elapsed() > std::time::Duration::from_millis(100) {
+                    self.pending_render_request = false;
+                    self.request_render_2d(Some(ctx.clone()));
+                } else {
+                    ctx.request_repaint();
+                }
+            }
+        }
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Netbrot");
@@ -225,8 +242,9 @@ impl App {
         egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             if !self.is_3d {
                 if let Some(rx) = &self.render_rx {
-                    while let Ok(color_image) = rx.try_recv() {
+                    while let Ok((color_image, r_bbox)) = rx.try_recv() {
                         self.texture = Some(ctx.load_texture("fractal", color_image, egui::TextureOptions::LINEAR));
+                        self.render_bbox = r_bbox;
                     }
                 }
                 
@@ -239,7 +257,19 @@ impl App {
                         egui::vec2(available.x, available.x / aspect)
                     };
                     
-                    let response = ui.add(egui::Image::new(texture).fit_to_exact_size(size).sense(egui::Sense::click_and_drag()));
+                    let render_width = self.render_bbox.1 - self.render_bbox.0;
+                    let render_height = self.render_bbox.3 - self.render_bbox.2;
+                    let u0 = (self.bbox.0 - self.render_bbox.0) / render_width;
+                    let u1 = (self.bbox.1 - self.render_bbox.0) / render_width;
+                    let v0 = (self.render_bbox.3 - self.bbox.3) / render_height;
+                    let v1 = (self.render_bbox.3 - self.bbox.2) / render_height;
+                    
+                    let uv = egui::Rect::from_min_max(
+                        egui::pos2(u0 as f32, v0 as f32),
+                        egui::pos2(u1 as f32, v1 as f32),
+                    );
+                    
+                    let response = ui.add(egui::Image::new(texture).fit_to_exact_size(size).uv(uv).sense(egui::Sense::click_and_drag()));
                     
                     if response.dragged() {
                         let delta = response.drag_delta();
@@ -253,7 +283,8 @@ impl App {
                         self.bbox.2 += dy;
                         self.bbox.3 += dy;
                         
-                        self.request_render_2d(Some(ctx.clone()));
+                        self.last_interaction_time = Some(std::time::Instant::now());
+                        self.pending_render_request = true;
                     }
                     
                     let scroll = ui.input(|i| i.smooth_scroll_delta);
@@ -279,7 +310,8 @@ impl App {
                         self.bbox.3 = center_y + y_rel * new_height;
                         self.bbox.2 = center_y - (1.0 - y_rel) * new_height;
                         
-                        self.request_render_2d(Some(ctx.clone()));
+                        self.last_interaction_time = Some(std::time::Instant::now());
+                        self.pending_render_request = true;
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
