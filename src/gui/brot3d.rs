@@ -61,7 +61,7 @@ pub fn combined_pass_params(base: &BrotParams) -> (BrotParams, BrotParams) {
     (bifurcation, wide)
 }
 
-/// Downsample before upload — drawing 10M+ GL points per frame will always lag.
+/// Downsample for display while keeping high-|z| "ray" points that uniform stride would drop.
 pub fn subsample_points(
     positions: Vec<Vec3>,
     colors: Vec<Srgba>,
@@ -71,15 +71,50 @@ pub fn subsample_points(
     if n <= max_points {
         return (positions, colors);
     }
-    let stride = n.div_ceil(max_points);
+
+    // Reserve ~35% of the budget for tail points (large |z|, the faint vertical rays).
+    let tail_budget = (max_points as f32 * 0.35) as usize;
+    let core_budget = max_points.saturating_sub(tail_budget);
+
+    let mut tail_indices: Vec<usize> = positions
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.z.abs() > 0.15)
+        .map(|(i, _)| i)
+        .collect();
+    tail_indices.sort_by(|&a, &b| {
+        positions[b]
+            .z
+            .abs()
+            .partial_cmp(&positions[a].z.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut picked = vec![false; n];
     let mut pos = Vec::with_capacity(max_points);
     let mut col = Vec::with_capacity(max_points);
+
+    if !tail_indices.is_empty() {
+        let tail_stride = tail_indices.len().div_ceil(tail_budget.max(1));
+        for (j, &idx) in tail_indices.iter().enumerate() {
+            if j % tail_stride == 0 && pos.len() < tail_budget {
+                pos.push(positions[idx]);
+                col.push(colors[idx]);
+                picked[idx] = true;
+            }
+        }
+    }
+
+    let stride = n.div_ceil(core_budget.max(1));
     let mut i = 0;
     while i < n && pos.len() < max_points {
-        pos.push(positions[i]);
-        col.push(colors[i]);
+        if !picked[i] {
+            pos.push(positions[i]);
+            col.push(colors[i]);
+        }
         i += stride;
     }
+
     (pos, col)
 }
 

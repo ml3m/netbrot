@@ -61,18 +61,22 @@ impl Geometry for PointCloudGeometry {
     fn vertex_shader_source(&self) -> String {
         "
         uniform mat4 viewProjection;
-
         uniform mat4 modelMatrix;
         uniform float pointSize;
+        uniform float tailEmphasis;
+        uniform float tailScale;
 
         in vec3 position;
         in vec4 color;
 
         out vec4 fragColor;
+        out float tailWeight;
 
         void main() {
             gl_Position = viewProjection * modelMatrix * vec4(position, 1.0);
-            gl_PointSize = pointSize;
+            float height = abs(position.z);
+            tailWeight = clamp(height / max(tailScale, 1.0e-4), 0.0, 1.0);
+            gl_PointSize = pointSize * (1.0 + tailEmphasis * tailWeight);
             fragColor = color;
         }
         "
@@ -119,6 +123,10 @@ impl Geometry for PointCloudGeometry {
 pub struct PointCloudMaterial {
     pub point_size: f32,
     pub opacity: f32,
+    /// Enlarge + brighten points far from z = 0 (the vertical orbit "rays").
+    pub tail_emphasis: f32,
+    /// |z| value at which tail boost reaches full strength.
+    pub tail_scale: f32,
     pub is_transparent: bool,
 }
 
@@ -127,6 +135,8 @@ impl Default for PointCloudMaterial {
         Self {
             point_size: 1.0,
             opacity: 1.0,
+            tail_emphasis: 2.5,
+            tail_scale: 0.35,
             is_transparent: true,
         }
     }
@@ -136,11 +146,25 @@ impl Material for PointCloudMaterial {
     fn fragment_shader_source(&self, _lights: &[&dyn Light]) -> String {
         "
         uniform float opacity;
+        uniform float tailEmphasis;
+
         in vec4 fragColor;
+        in float tailWeight;
         out vec4 outColor;
 
         void main() {
-            outColor = vec4(fragColor.rgb, fragColor.a * opacity);
+            // Soft circular points read better than square GL_POINTS splats.
+            vec2 uv = gl_PointCoord - vec2(0.5);
+            float dist2 = dot(uv, uv);
+            if (dist2 > 0.25) {
+                discard;
+            }
+            float soft = exp(-dist2 * 10.0);
+
+            float boost = 1.0 + tailEmphasis * tailWeight;
+            vec3 rgb = fragColor.rgb * boost;
+            float alpha = fragColor.a * opacity * soft * boost;
+            outColor = vec4(rgb, alpha);
         }
         "
         .to_string()
@@ -149,6 +173,8 @@ impl Material for PointCloudMaterial {
     fn use_uniforms(&self, program: &Program, _viewer: &dyn Viewer, _lights: &[&dyn Light]) {
         program.use_uniform("pointSize", self.point_size);
         program.use_uniform("opacity", self.opacity);
+        program.use_uniform("tailEmphasis", self.tail_emphasis);
+        program.use_uniform("tailScale", self.tail_scale);
     }
 
     fn render_states(&self) -> RenderStates {

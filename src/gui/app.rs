@@ -121,8 +121,10 @@ impl App {
             
             point_cloud: None,
             material: PointCloudMaterial {
-                point_size: 0.8,
+                point_size: 1.2,
                 opacity: 1.0,
+                tail_emphasis: 2.5,
+                tail_scale: 0.35,
                 is_transparent: true,
             },
             points_generated: false,
@@ -510,6 +512,15 @@ impl App {
                 
                 ui.add(egui::Slider::new(&mut self.material.point_size, 0.1..=10.0).text("Point Size"));
                 ui.add(egui::Slider::new(&mut self.material.opacity, 0.005..=1.0).text("Opacity"));
+                ui.add(
+                    egui::Slider::new(&mut self.material.tail_emphasis, 0.0..=8.0)
+                        .text("Ray emphasis"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.material.tail_scale, 0.05..=2.0)
+                        .text("Ray height scale"),
+                );
+                ui.label("Ray emphasis enlarges and brightens points far from z = 0.");
                 
                 if ui.button("Generate 3D Points").clicked() {
                     self.status_msg = Some("Generating 3D points...".to_string());
