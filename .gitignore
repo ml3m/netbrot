@@ -7,6 +7,5 @@ data/*.json
 
 /target
 *.mp4
-*.png
 *.mat
 *.npz
