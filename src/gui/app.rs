@@ -9,7 +9,20 @@ use egui::TextureHandle;
 use serde::{Serialize, Deserialize};
 use nalgebra::DMatrix;
 use num::complex::{c64, Complex64};
+use std::sync::mpsc::{Sender, Receiver, channel};
+use std::thread;
 use rand::Rng;
+
+pub struct RenderRequest {
+    pub render_type: RenderType,
+    pub resolution: usize,
+    pub bbox: (f64, f64, f64, f64),
+    pub brot: Netbrot,
+    pub color_type: ColorType,
+    pub period: u32,
+    pub eps: f64,
+    pub egui_ctx: Option<egui::Context>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GenMatrixType {
@@ -38,6 +51,8 @@ pub struct App {
     
     // 2D state
     pub color_image_texture: Option<egui::TextureHandle>,
+    pub render_tx: Option<Sender<RenderRequest>>,
+    pub render_rx: Option<Receiver<egui::ColorImage>>,
     
     pub gen_matrix_type: GenMatrixType,
     pub gen_matrix_size: usize,
@@ -69,7 +84,7 @@ pub struct App {
 
 impl App {
     pub fn new(context: &Context) -> Self {
-        Self {
+        let mut app = Self {
             // A 1x1 identity matrix z_{n+1} = z_n^2 + c
             netbrot: Netbrot::new(&DMatrix::from_element(1, 1, num::complex::c64(1.0, 0.0)), 100, 4.0),
             render_type: RenderType::Mandelbrot,
@@ -81,6 +96,9 @@ impl App {
             use_gpu: true,
             
             color_image_texture: None,
+            render_tx: None,
+            render_rx: None,
+            
             gen_matrix_type: GenMatrixType::Feedforward,
             gen_matrix_size: 2,
             texture: None,
@@ -108,7 +126,47 @@ impl App {
             matrix_values: vec![(1.0, 0.0)],
             
             context: context.clone(),
-        }
+        };
+        
+        let (tx, rx_thread) = channel::<RenderRequest>();
+        let (tx_thread, rx) = channel::<egui::ColorImage>();
+        
+        thread::spawn(move || {
+            let mut current_params: Option<RenderRequest> = None;
+            loop {
+                if current_params.is_none() {
+                    match rx_thread.recv() {
+                        Ok(params) => current_params = Some(params),
+                        Err(_) => break, // channel closed
+                    }
+                }
+                
+                while let Ok(params) = rx_thread.try_recv() {
+                    current_params = Some(params);
+                }
+                
+                if let Some(params) = current_params.take() {
+                    let image = render_image(
+                        params.render_type,
+                        (params.resolution, params.resolution),
+                        params.bbox,
+                        &params.brot,
+                        params.color_type,
+                        params.period,
+                        params.eps,
+                    );
+                    let _ = tx_thread.send(image);
+                    if let Some(ctx) = params.egui_ctx {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        });
+        
+        app.render_tx = Some(tx);
+        app.render_rx = Some(rx);
+        
+        app
     }
 
     pub fn draw_gui(&mut self, ctx: &egui::Context) {
@@ -164,6 +222,12 @@ impl App {
 
         egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             if !self.is_3d {
+                if let Some(rx) = &self.render_rx {
+                    while let Ok(color_image) = rx.try_recv() {
+                        self.texture = Some(ctx.load_texture("fractal", color_image, egui::TextureOptions::LINEAR));
+                    }
+                }
+                
                 if let Some(texture) = &self.texture {
                     let available = ui.available_size();
                     let aspect = texture.size()[0] as f32 / texture.size()[1] as f32;
@@ -172,7 +236,48 @@ impl App {
                     } else {
                         egui::vec2(available.x, available.x / aspect)
                     };
-                    ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+                    
+                    let response = ui.add(egui::Image::new(texture).fit_to_exact_size(size).sense(egui::Sense::click_and_drag()));
+                    
+                    if response.dragged() {
+                        let delta = response.drag_delta();
+                        let width = self.bbox.1 - self.bbox.0;
+                        let height = self.bbox.3 - self.bbox.2;
+                        let dx = (delta.x as f64 / size.x as f64) * width;
+                        let dy = (delta.y as f64 / size.y as f64) * height;
+                        
+                        self.bbox.0 -= dx;
+                        self.bbox.1 -= dx;
+                        self.bbox.2 += dy;
+                        self.bbox.3 += dy;
+                        
+                        self.request_render_2d(Some(ctx.clone()));
+                    }
+                    
+                    let scroll = ui.input(|i| i.smooth_scroll_delta);
+                    if response.hovered() && scroll.y != 0.0 {
+                        let zoom_factor = if scroll.y > 0.0 { 0.8 } else { 1.25 };
+                        
+                        let pointer_pos = response.hover_pos().unwrap_or(response.rect.center());
+                        let x_rel = (pointer_pos.x - response.rect.left()) as f64 / size.x as f64;
+                        let y_rel = (pointer_pos.y - response.rect.top()) as f64 / size.y as f64;
+                        
+                        let width = self.bbox.1 - self.bbox.0;
+                        let height = self.bbox.3 - self.bbox.2;
+                        
+                        let center_x = self.bbox.0 + x_rel * width;
+                        let center_y = self.bbox.3 - y_rel * height;
+                        
+                        let new_width = width * zoom_factor;
+                        let new_height = height * zoom_factor;
+                        
+                        self.bbox.0 = center_x - x_rel * new_width;
+                        self.bbox.1 = center_x + (1.0 - x_rel) * new_width;
+                        self.bbox.3 = center_y + y_rel * new_height;
+                        self.bbox.2 = center_y - (1.0 - y_rel) * new_height;
+                        
+                        self.request_render_2d(Some(ctx.clone()));
+                    }
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label("Configure matrix and generate, or load an exhibit JSON.");
@@ -310,10 +415,15 @@ impl App {
                         });
                 });
                 
-                if ui.button("Generate 2D").clicked() {
-                    let ctx = ui.ctx().clone();
-                    self.apply_matrix_and_generate_2d(&ctx);
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Generate 2D").clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.apply_matrix_and_generate_2d(&ctx);
+                    }
+                    if ui.button("💾 Save High Quality").clicked() {
+                        self.save_high_quality();
+                    }
+                });
             });
             
         egui::CollapsingHeader::new("3D Visualization Settings")
@@ -434,18 +544,70 @@ impl App {
         }
     }
     
+    pub fn request_render_2d(&self, ctx: Option<egui::Context>) {
+        if let Some(tx) = &self.render_tx {
+            let req = RenderRequest {
+                render_type: self.render_type,
+                resolution: self.resolution,
+                bbox: self.bbox,
+                brot: self.netbrot.clone(),
+                color_type: self.color_type,
+                period: self.period,
+                eps: self.eps,
+                egui_ctx: ctx,
+            };
+            let _ = tx.send(req);
+        }
+    }
+    
+    pub fn save_high_quality(&self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG", &["png"])
+            .save_file() {
+            
+            let req = RenderRequest {
+                render_type: self.render_type,
+                resolution: 4000,
+                bbox: self.bbox,
+                brot: self.netbrot.clone(),
+                color_type: self.color_type,
+                period: self.period,
+                eps: self.eps,
+                egui_ctx: None,
+            };
+            
+            std::thread::spawn(move || {
+                let color_image = render_image(
+                    req.render_type,
+                    (req.resolution, req.resolution),
+                    req.bbox,
+                    &req.brot,
+                    req.color_type,
+                    req.period,
+                    req.eps,
+                );
+                
+                let width = color_image.size[0] as u32;
+                let height = color_image.size[1] as u32;
+                let mut rgb_image = image::RgbImage::new(width, height);
+                
+                for (i, pixel) in color_image.pixels.iter().enumerate() {
+                    let x = (i as u32) % width;
+                    let y = (i as u32) / width;
+                    rgb_image.put_pixel(x, y, image::Rgb([pixel.r(), pixel.g(), pixel.b()]));
+                }
+                
+                if let Err(e) = rgb_image.save(&path) {
+                    eprintln!("Failed to save image to {:?}: {}", path, e);
+                } else {
+                    println!("Saved high quality image to {:?}", path);
+                }
+            });
+        }
+    }
+
     pub fn generate_2d(&mut self, ctx: &egui::Context) {
-        let color_image = render_image(
-            self.render_type,
-            (self.resolution, self.resolution),
-            self.bbox,
-            &self.netbrot,
-            self.color_type,
-            self.period,
-            self.eps,
-        );
-        
-        self.texture = Some(ctx.load_texture("fractal", color_image, egui::TextureOptions::LINEAR));
+        self.request_render_2d(Some(ctx.clone()));
     }
     
     pub fn load_exhibit(&mut self, path: &std::path::Path) {
