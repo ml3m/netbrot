@@ -99,6 +99,14 @@ z_2^{n + 1}
     <img src="https://github.com/alexfikl/netbrot/blob/main/docs/netbrot-2x2.png?raw=true" alt="Netbrot 2x2"/>
 </p>
 
+<p align="center">
+    <img src="https://github.com/ml3m/netbrot/blob/main/docs/other.png?raw=true" alt="Netbrot 2x2"/>
+</p>
+
+<p align="center">
+    <img src="https://github.com/ml3m/netbrot/blob/main/docs/spiraling.png?raw=true" alt="Netbrot 2x2"/>
+</p>
+
 Obtained by running
 ```bash
 netbrot -r 2000 -m 128 data/readme.json
