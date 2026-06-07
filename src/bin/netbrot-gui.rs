@@ -26,6 +26,10 @@ pub fn main() {
 
     let mut keys = [false; 4]; // W, A, S, D
 
+    // Track whether the user has manually moved the camera since last generation
+    let mut camera_user_moved = false;
+    let mut last_points_generated = false;
+
     // main loop
     window.render_loop(move |mut frame_input| {
         camera.set_viewport(frame_input.viewport);
@@ -47,16 +51,19 @@ pub fn main() {
                     Event::KeyPress { kind: Key::D, .. } => keys[3] = true,
                     Event::KeyRelease { kind: Key::D, .. } => keys[3] = false,
                     Event::KeyPress { kind: Key::R, .. } => {
+                        // Reset view — use scene-computed suggested camera
+                        let (eye, target, up) = app.scene.suggested_camera();
                         camera = Camera::new_perspective(
                             frame_input.viewport,
-                            vec3(-1.0, -5.0, 1.5),
-                            vec3(-1.0, 0.0, 0.0),
-                            vec3(0.0, 0.0, 1.0),
+                            eye,
+                            target,
+                            up,
                             degrees(45.0),
                             0.1,
                             1000.0,
                         );
-                        control.target = vec3(-1.0, 0.0, 0.0);
+                        control.target = target;
+                        camera_user_moved = false;
                     }
                     Event::MouseMotion { delta, button: Some(MouseButton::Left), handled, modifiers, .. } => {
                         if !*handled && modifiers.shift {
@@ -66,6 +73,11 @@ pub fn main() {
                             control.target += pan_amount;
                             *handled = true;
                         }
+                        // Any left-button drag (shift-pan or orbit) counts as user-moved
+                        camera_user_moved = true;
+                    }
+                    Event::MouseWheel { .. } => {
+                        camera_user_moved = true;
                     }
                     _ => {}
                 }
@@ -81,6 +93,7 @@ pub fn main() {
                 movement = movement.normalize() * speed;
                 camera.translate(movement);
                 control.target += movement;
+                camera_user_moved = true;
             }
 
             control.handle_events(&mut camera, &mut frame_input.events);
@@ -97,17 +110,116 @@ pub fn main() {
             },
         );
 
+        // Auto-fit camera when points are first generated (unless user has moved it)
+        if app.points_generated && !last_points_generated && !camera_user_moved {
+            let (eye, target, up) = app.scene.suggested_camera();
+            camera = Camera::new_perspective(
+                frame_input.viewport,
+                eye,
+                target,
+                up,
+                degrees(45.0),
+                0.1,
+                1000.0,
+            );
+            control.target = target;
+        }
+        last_points_generated = app.points_generated;
+
         let screen = frame_input.screen();
-        screen.clear(ClearState::color_and_depth(0.1, 0.1, 0.1, 1.0, 1.0));
+        screen.clear(ClearState::color_and_depth(0.05, 0.05, 0.07, 1.0, 1.0));
             
-        if app.is_3d && app.points_generated {
-            if let Some(pc) = &app.point_cloud {
-                screen.render_with_material(
-                    &app.material,
-                    &camera,
-                    &[pc],
-                    &[],
-                );
+        if app.is_3d {
+            if app.points_generated {
+                // Render each visible layer with its own material
+                for layer in app.scene.visible_layers() {
+                    let mat = app.build_material_for_layer(layer);
+                    screen.render_with_material(
+                        &mat,
+                        &camera,
+                        &[&layer.geometry],
+                        &[],
+                    );
+                }
+            }
+
+            // Render link overlay if present (even if points not generated)
+            if let Some(link) = &app.scene.link {
+                if let Some(mesh) = &link.line_mesh {
+                    screen.render(
+                        &camera,
+                        &[mesh],
+                        &[],
+                    );
+                }
+            }
+        }
+
+        // Handle screenshot request — offscreen render without egui
+        if app.screenshot_requested {
+            app.screenshot_requested = false;
+            if app.is_3d && app.points_generated {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("PNG", &["png"])
+                    .save_file()
+                {
+                    let vp = frame_input.viewport;
+                    let width = vp.width;
+                    let height = vp.height;
+
+                    // Render to offscreen target
+                    let color_tex = Texture2D::new_empty::<[u8; 4]>(
+                        &context,
+                        width,
+                        height,
+                        Interpolation::Linear,
+                        Interpolation::Linear,
+                        None,
+                        Wrapping::ClampToEdge,
+                        Wrapping::ClampToEdge,
+                    );
+                    let depth_tex = DepthTexture2D::new::<f32>(
+                        &context,
+                        width,
+                        height,
+                        Wrapping::ClampToEdge,
+                        Wrapping::ClampToEdge,
+                    );
+                    let render_target = RenderTarget::new(
+                        color_tex.as_color_target(None),
+                        depth_tex.as_depth_target(),
+                    );
+                    render_target.clear(ClearState::color_and_depth(0.05, 0.05, 0.07, 1.0, 1.0));
+
+                    for layer in app.scene.visible_layers() {
+                        let mat = app.build_material_for_layer(layer);
+                        render_target.render_with_material(
+                            &mat,
+                            &camera,
+                            &[&layer.geometry],
+                            &[],
+                        );
+                    }
+
+                    // Read back pixels
+                    let pixels: Vec<[u8; 4]> = render_target.read_color();
+                    let mut img = image::RgbaImage::new(width, height);
+                    for (i, rgba) in pixels.iter().enumerate() {
+                        let x = (i as u32) % width;
+                        let y = (i as u32) / width;
+                        // Flip Y: OpenGL reads bottom-up
+                        let flipped_y = height - 1 - y;
+                        img.put_pixel(x, flipped_y, image::Rgba(*rgba));
+                    }
+
+                    std::thread::spawn(move || {
+                        if let Err(e) = img.save(&path) {
+                            eprintln!("Failed to save 3D screenshot: {e}");
+                        } else {
+                            println!("Saved 3D screenshot to {path:?}");
+                        }
+                    });
+                }
             }
         }
 

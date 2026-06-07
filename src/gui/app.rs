@@ -5,8 +5,10 @@ use crate::gui::brot3d::{
     BrotMode, BrotParams, combined_pass_params, generate_points_cpu, generate_points_gpu,
     subsample_points,
 };
+use crate::gui::colormap3d::{BlendMode3d, ColorMode3d, Colormap3d};
 use crate::gui::point_cloud::{PointCloudGeometry, PointCloudMaterial};
 use crate::gui::render2d::render_image;
+use crate::gui::scene3d::{LayerKind, PointCloudLayer, Scene3D};
 use three_d::*;
 use egui::TextureHandle;
 use serde::{Serialize, Deserialize};
@@ -14,7 +16,6 @@ use nalgebra::DMatrix;
 use num::complex::{c64, Complex64};
 use std::sync::mpsc::{Sender, Receiver, channel};
 use std::thread;
-use rand::Rng;
 
 pub struct RenderRequest {
     pub render_type: RenderType,
@@ -69,11 +70,27 @@ pub struct App {
     pub last_interaction_time: Option<std::time::Instant>,
     pub pending_render_request: bool,
     
-    // 3D state
-    pub point_cloud: Option<PointCloudGeometry>,
-    pub material: PointCloudMaterial,
+    // 3D state — now scene-based
+    pub scene: Scene3D,
     pub points_generated: bool,
     pub max_display_points: usize,
+
+    // Per-layer material defaults
+    pub bifurcation_opacity: f32,
+    pub bifurcation_point_size: f32,
+    pub wide_opacity: f32,
+    pub wide_point_size: f32,
+
+    // Global material settings
+    pub tail_emphasis: f32,
+    pub tail_scale: f32,
+
+    // 2D ↔ 3D link
+    pub linked_c: Option<(f64, f64)>,
+    pub link_enabled: bool,
+
+    // Screenshot
+    pub screenshot_requested: bool,
 
     pub status_msg: Option<String>,
     pub generation_pending: bool,
@@ -119,16 +136,22 @@ impl App {
             last_interaction_time: None,
             pending_render_request: false,
             
-            point_cloud: None,
-            material: PointCloudMaterial {
-                point_size: 1.2,
-                opacity: 1.0,
-                tail_emphasis: 2.5,
-                tail_scale: 0.35,
-                is_transparent: true,
-            },
+            scene: Scene3D::new(),
             points_generated: false,
             max_display_points: 500_000,
+
+            bifurcation_opacity: 0.12,
+            bifurcation_point_size: 1.2,
+            wide_opacity: 0.05,
+            wide_point_size: 1.0,
+
+            tail_emphasis: 2.5,
+            tail_scale: 0.35,
+
+            linked_c: None,
+            link_enabled: false,
+
+            screenshot_requested: false,
 
             status_msg: None,
             generation_pending: false,
@@ -284,6 +307,21 @@ impl App {
                     
                     let response = ui.add(egui::Image::new(texture).fit_to_exact_size(size).uv(uv).sense(egui::Sense::click_and_drag()));
                     
+                    // 2D → 3D link: click to select c-value
+                    if self.link_enabled && response.clicked() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let x_rel = (pos.x - response.rect.left()) as f64 / size.x as f64;
+                            let y_rel = (pos.y - response.rect.top()) as f64 / size.y as f64;
+                            let width = self.bbox.1 - self.bbox.0;
+                            let height = self.bbox.3 - self.bbox.2;
+                            let c_re = self.bbox.0 + x_rel * width;
+                            let c_im = self.bbox.3 - y_rel * height;
+                            self.linked_c = Some((c_re, c_im));
+                            // Update 3D link overlay
+                            self.scene.update_link_overlay(&self.context, c_re as f32, c_im as f32);
+                        }
+                    }
+
                     if response.dragged() {
                         let delta = response.drag_delta();
                         let width = self.bbox.1 - self.bbox.0;
@@ -325,6 +363,42 @@ impl App {
                         
                         self.last_interaction_time = Some(std::time::Instant::now());
                         self.pending_render_request = true;
+                    }
+
+                    // Draw linked-c crosshair on the 2D panel
+                    if let Some((c_re, c_im)) = self.linked_c {
+                        let width = self.bbox.1 - self.bbox.0;
+                        let height = self.bbox.3 - self.bbox.2;
+                        let x_frac = (c_re - self.bbox.0) / width;
+                        let y_frac = (self.bbox.3 - c_im) / height;
+                        if x_frac >= 0.0 && x_frac <= 1.0 && y_frac >= 0.0 && y_frac <= 1.0 {
+                            let px = response.rect.left() + x_frac as f32 * size.x;
+                            let py = response.rect.top() + y_frac as f32 * size.y;
+                            let painter = ui.painter();
+                            let cross_size = 8.0;
+                            let color = egui::Color32::from_rgb(255, 80, 80);
+                            painter.line_segment(
+                                [egui::pos2(px - cross_size, py), egui::pos2(px + cross_size, py)],
+                                egui::Stroke::new(2.0, color),
+                            );
+                            painter.line_segment(
+                                [egui::pos2(px, py - cross_size), egui::pos2(px, py + cross_size)],
+                                egui::Stroke::new(2.0, color),
+                            );
+                            painter.circle_stroke(
+                                egui::pos2(px, py),
+                                6.0,
+                                egui::Stroke::new(1.5, color),
+                            );
+                            // Label
+                            painter.text(
+                                egui::pos2(px + 10.0, py - 14.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                format!("c = {:.4} + {:.4}i", c_re, c_im),
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::from_rgb(255, 200, 200),
+                            );
+                        }
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
@@ -509,23 +583,116 @@ impl App {
                     "Each bounded c-path records up to Keep orbit points. \
                      Combined ≈ NX×Keep + (NX/4)×(NY/2)×min(Keep,100).",
                 );
-                
-                ui.add(egui::Slider::new(&mut self.material.point_size, 0.1..=10.0).text("Point Size"));
-                ui.add(egui::Slider::new(&mut self.material.opacity, 0.005..=1.0).text("Opacity"));
+
+                ui.separator();
+                ui.heading("Layer Controls");
+
+                // Per-layer visibility and material
+                if self.brot_params.mode == BrotMode::Combined || self.brot_params.mode == BrotMode::Bifurcation {
+                    let mut bif_visible = self.scene.bifurcation.as_ref().map_or(true, |l| l.visible);
+                    if ui.checkbox(&mut bif_visible, "Show Bifurcation").changed() {
+                        if let Some(l) = &mut self.scene.bifurcation {
+                            l.visible = bif_visible;
+                        }
+                    }
+                    ui.add(egui::Slider::new(&mut self.bifurcation_opacity, 0.005..=1.0).text("Bifurcation Opacity"));
+                    ui.add(egui::Slider::new(&mut self.bifurcation_point_size, 0.1..=10.0).text("Bifurcation Point Size"));
+                }
+
+                if self.brot_params.mode == BrotMode::Combined || self.brot_params.mode == BrotMode::WideAttractor {
+                    let mut wide_visible = self.scene.wide.as_ref().map_or(true, |l| l.visible);
+                    if ui.checkbox(&mut wide_visible, "Show Wide").changed() {
+                        if let Some(l) = &mut self.scene.wide {
+                            l.visible = wide_visible;
+                        }
+                    }
+                    ui.add(egui::Slider::new(&mut self.wide_opacity, 0.005..=1.0).text("Wide Opacity"));
+                    ui.add(egui::Slider::new(&mut self.wide_point_size, 0.1..=10.0).text("Wide Point Size"));
+                }
+
+                ui.separator();
+                ui.heading("Visual Controls");
+
                 ui.add(
-                    egui::Slider::new(&mut self.material.tail_emphasis, 0.0..=8.0)
+                    egui::Slider::new(&mut self.tail_emphasis, 0.0..=8.0)
                         .text("Ray emphasis"),
                 );
                 ui.add(
-                    egui::Slider::new(&mut self.material.tail_scale, 0.05..=2.0)
+                    egui::Slider::new(&mut self.tail_scale, 0.05..=2.0)
                         .text("Ray height scale"),
                 );
                 ui.label("Ray emphasis enlarges and brightens points far from z = 0.");
-                
-                if ui.button("Generate 3D Points").clicked() {
-                    self.status_msg = Some("Generating 3D points...".to_string());
-                    self.generation_pending = true;
+
+                // Color mode
+                ui.horizontal(|ui| {
+                    ui.label("Color Mode:");
+                    egui::ComboBox::from_id_source("color_mode_3d")
+                        .selected_text(self.scene.color_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in ColorMode3d::ALL {
+                                ui.selectable_value(&mut self.scene.color_mode, mode, mode.label());
+                            }
+                        });
+                });
+
+                // Colormap
+                ui.horizontal(|ui| {
+                    ui.label("Colormap:");
+                    egui::ComboBox::from_id_source("colormap_3d")
+                        .selected_text(self.scene.colormap.label())
+                        .show_ui(ui, |ui| {
+                            for cm in Colormap3d::ALL {
+                                ui.selectable_value(&mut self.scene.colormap, cm, cm.label());
+                            }
+                        });
+                });
+
+                // Blend mode
+                ui.horizontal(|ui| {
+                    ui.label("Blend Mode:");
+                    egui::ComboBox::from_id_source("blend_mode_3d")
+                        .selected_text(self.scene.blend_mode.label())
+                        .show_ui(ui, |ui| {
+                            for bm in BlendMode3d::ALL {
+                                ui.selectable_value(&mut self.scene.blend_mode, bm, bm.label());
+                            }
+                        });
+                });
+
+                ui.separator();
+                ui.heading("Clipping");
+
+                ui.add(egui::Slider::new(&mut self.scene.clip.re_min, -5.0..=5.0).text("Clip Re(c) min"));
+                ui.add(egui::Slider::new(&mut self.scene.clip.re_max, -5.0..=5.0).text("Clip Re(c) max"));
+                ui.add(egui::Slider::new(&mut self.scene.clip.im_min, -5.0..=5.0).text("Clip Im(c) min"));
+                ui.add(egui::Slider::new(&mut self.scene.clip.im_max, -5.0..=5.0).text("Clip Im(c) max"));
+                ui.add(egui::Slider::new(&mut self.scene.clip.z_min, -5.0..=5.0).text("Clip Re(z) min"));
+                ui.add(egui::Slider::new(&mut self.scene.clip.z_max, -5.0..=5.0).text("Clip Re(z) max"));
+                if ui.button("Reset Clip to AABB").clicked() {
+                    self.scene.reset_clip_to_aabb();
                 }
+
+                ui.separator();
+                ui.heading("2D ↔ 3D Link");
+                ui.checkbox(&mut self.link_enabled, "Enable 2D↔3D link");
+                if self.linked_c.is_some() {
+                    if ui.button("Clear Link").clicked() {
+                        self.linked_c = None;
+                        self.scene.clear_link_overlay();
+                    }
+                }
+
+                ui.separator();
+                
+                ui.horizontal(|ui| {
+                    if ui.button("Generate 3D Points").clicked() {
+                        self.status_msg = Some("Generating 3D points...".to_string());
+                        self.generation_pending = true;
+                    }
+                    if ui.button("📸 Save 3D View").clicked() {
+                        self.screenshot_requested = true;
+                    }
+                });
                 
                 if let Some(msg) = &self.status_msg {
                     ui.label(msg);
@@ -551,60 +718,172 @@ impl App {
         self.brot_params.im_max = self.bbox.3 as f32;
         self.brot_params.escape_r = self.escape_radius as f32;
 
-        let generate = |params: &BrotParams| -> (Vec<Vec3>, Vec<Srgba>) {
-            if self.use_gpu {
-                match generate_points_gpu(&self.context, params, &self.netbrot.mat) {
+        // Extract fields needed by generation to avoid borrowing all of `self`
+        let use_gpu = self.use_gpu;
+        let context = self.context.clone();
+        let mat = self.netbrot.mat.clone();
+
+        let do_generate = |params: &BrotParams| -> (Vec<Vec3>, Vec<Srgba>) {
+            if use_gpu {
+                match generate_points_gpu(&context, params, &mat) {
                     Ok(res) => res,
                     Err(e) => {
                         eprintln!("GPU err: {e}");
-                        generate_points_cpu(params, &self.netbrot.mat)
+                        generate_points_cpu(params, &mat)
                     }
                 }
             } else {
-                generate_points_cpu(params, &self.netbrot.mat)
+                generate_points_cpu(params, &mat)
             }
         };
 
-        let (mut positions, mut colors, detail) = if self.brot_params.mode == BrotMode::Combined {
+        // Generate layers separately
+        let mut all_positions = Vec::new();
+
+        if self.brot_params.mode == BrotMode::Combined {
             let (p1, p2) = combined_pass_params(&self.brot_params);
-            let (pos1, col1) = generate(&p1);
-            let (pos2, col2) = generate(&p2);
+
+            // Bifurcation layer
+            let (pos1, col1) = do_generate(&p1);
+            let raw1 = pos1.len();
+            let bif_budget = (self.max_display_points as f32 * 0.65) as usize;
+            let (pos1, col1) = subsample_points(pos1, col1, bif_budget);
             let n1 = pos1.len();
+            all_positions.extend_from_slice(&pos1);
+            self.create_or_update_layer(LayerKind::Bifurcation, pos1, col1);
+
+            // Wide layer
+            let (pos2, col2) = do_generate(&p2);
+            let raw2 = pos2.len();
+            let wide_budget = self.max_display_points.saturating_sub(n1);
+            let (pos2, col2) = subsample_points(pos2, col2, wide_budget);
             let n2 = pos2.len();
-            let mut pos = pos1;
-            let mut col = col1;
-            pos.extend(pos2);
-            col.extend(col2);
-            (
-                pos,
-                col,
-                format!("{n1} bifurcation + {n2} wide"),
-            )
-        } else {
-            let (pos, col) = generate(&self.brot_params);
-            let n = pos.len();
-            (pos, col, format!("{n} total"))
-        };
+            all_positions.extend_from_slice(&pos2);
+            self.create_or_update_layer(LayerKind::Wide, pos2, col2);
 
-        let raw_count = positions.len();
-        (positions, colors) = subsample_points(positions, colors, self.max_display_points);
-        let shown = positions.len();
-
-        if !positions.is_empty() {
-            if let Some(pc) = self.point_cloud.as_mut() {
-                pc.update(&positions, &colors);
-            } else {
-                let mut pc = PointCloudGeometry::new(&self.context);
-                pc.update(&positions, &colors);
-                self.point_cloud = Some(pc);
-            }
-            self.points_generated = true;
             self.status_msg = Some(format!(
-                "Showing {shown} points ({detail}; raw {raw_count}, cap {})",
+                "Showing {n1}+{n2} pts (raw {raw1}+{raw2}, cap {})",
                 self.max_display_points,
             ));
         } else {
+            let params = self.brot_params.clone();
+            let (pos, col) = do_generate(&params);
+            let raw_count = pos.len();
+            let (pos, col) = subsample_points(pos, col, self.max_display_points);
+            let shown = pos.len();
+            all_positions.extend_from_slice(&pos);
+
+            let kind = match self.brot_params.mode {
+                BrotMode::Bifurcation => LayerKind::Bifurcation,
+                _ => LayerKind::Wide,
+            };
+            self.create_or_update_layer(kind, pos, col);
+
+            // Clear the other layer
+            match kind {
+                LayerKind::Bifurcation => self.scene.wide = None,
+                LayerKind::Wide => self.scene.bifurcation = None,
+            }
+
+            self.status_msg = Some(format!(
+                "Showing {shown} points (raw {raw_count}, cap {})",
+                self.max_display_points,
+            ));
+        }
+
+        if !all_positions.is_empty() {
+            self.scene.compute_aabb_from_positions(&all_positions);
+            self.scene.reset_clip_to_aabb();
+            self.points_generated = true;
+        } else {
             self.status_msg = Some("No bounded orbits found for these parameters.".to_string());
+        }
+    }
+
+    fn create_or_update_layer(&mut self, kind: LayerKind, positions: Vec<Vec3>, colors: Vec<Srgba>) {
+        if positions.is_empty() {
+            match kind {
+                LayerKind::Bifurcation => self.scene.bifurcation = None,
+                LayerKind::Wide => self.scene.wide = None,
+            }
+            return;
+        }
+
+        let count = positions.len();
+        let (opacity, point_size) = match kind {
+            LayerKind::Bifurcation => (self.bifurcation_opacity, self.bifurcation_point_size),
+            LayerKind::Wide => (self.wide_opacity, self.wide_point_size),
+        };
+
+        let layer_slot = match kind {
+            LayerKind::Bifurcation => &mut self.scene.bifurcation,
+            LayerKind::Wide => &mut self.scene.wide,
+        };
+
+        if let Some(layer) = layer_slot {
+            layer.geometry.update(&positions, &colors);
+            layer.count = count;
+        } else {
+            let mut geom = PointCloudGeometry::new(&self.context);
+            geom.update(&positions, &colors);
+            *layer_slot = Some(PointCloudLayer {
+                kind,
+                geometry: geom,
+                material: PointCloudMaterial {
+                    point_size,
+                    opacity,
+                    tail_emphasis: self.tail_emphasis,
+                    tail_scale: self.tail_scale,
+                    is_transparent: true,
+                    ..Default::default()
+                },
+                visible: true,
+                count,
+            });
+        }
+    }
+
+    /// Build a `PointCloudMaterial` for a given layer, applying current scene settings.
+    pub fn build_material_for_layer(&self, layer: &PointCloudLayer) -> PointCloudMaterial {
+        let (opacity, point_size) = match layer.kind {
+            LayerKind::Bifurcation => (self.bifurcation_opacity, self.bifurcation_point_size),
+            LayerKind::Wide => (self.wide_opacity, self.wide_point_size),
+        };
+
+        let scene_min = if self.scene.aabb_is_empty() {
+            vec3(-2.5, -1.15, -2.0)
+        } else {
+            self.scene.aabb.min()
+        };
+        let scene_max = if self.scene.aabb_is_empty() {
+            vec3(0.55, 1.15, 2.0)
+        } else {
+            self.scene.aabb.max()
+        };
+
+        PointCloudMaterial {
+            point_size,
+            opacity,
+            tail_emphasis: self.tail_emphasis,
+            tail_scale: self.tail_scale,
+            is_transparent: true,
+            point_size_reference: 5.0,
+            color_mode: self.scene.color_mode,
+            colormap: self.scene.colormap,
+            blend_mode: self.scene.blend_mode,
+            use_shader_coloring: true,
+            clip_min: vec3(
+                self.scene.clip.re_min,
+                self.scene.clip.im_min,
+                self.scene.clip.z_min,
+            ),
+            clip_max: vec3(
+                self.scene.clip.re_max,
+                self.scene.clip.im_max,
+                self.scene.clip.z_max,
+            ),
+            scene_min,
+            scene_max,
         }
     }
     

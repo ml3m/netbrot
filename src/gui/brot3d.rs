@@ -376,6 +376,9 @@ pub fn generate_points_gpu(context: &Context, params: &BrotParams, mat: &DMatrix
             uniform float im_min;
             uniform float im_max;
 
+            uniform int ndim;
+            uniform vec2 matrix[100]; // flattened N x N matrix (row-major)
+
             vec4 cool(float t) {
                 t = clamp(t, 0.0, 1.0);
                 return vec4(t, 1.0 - t, 1.0, 0.05);
@@ -391,15 +394,29 @@ pub fn generate_points_gpu(context: &Context, params: &BrotParams, mat: &DMatrix
                 float c_re = mix(re_min, re_max, tx);
                 float c_im = mix(im_min, im_max, ty);
 
-                float z_re = 0.0;
-                float z_im = 0.0;
+                vec2 Z[10];
+                for(int i=0; i<ndim; i++) Z[i] = vec2(0.0);
 
                 for (int i = 0; i < warmup; i++) {
-                    float z_re2 = z_re * z_re - z_im * z_im + c_re;
-                    float z_im2 = 2.0 * z_re * z_im + c_im;
-                    z_re = z_re2;
-                    z_im = z_im2;
-                    if (z_re * z_re + z_im * z_im > escape_r2) return;
+                    vec2 Z_sq[10];
+                    for(int j=0; j<ndim; j++) {
+                        Z_sq[j] = vec2(Z[j].x*Z[j].x - Z[j].y*Z[j].y, 2.0*Z[j].x*Z[j].y);
+                    }
+                    vec2 new_Z[10];
+                    float norm_sq = 0.0;
+                    for(int row=0; row<ndim; row++) {
+                        vec2 sum = vec2(c_re, c_im);
+                        for(int col=0; col<ndim; col++) {
+                            vec2 a = matrix[row * ndim + col];
+                            vec2 z_sq = Z_sq[col];
+                            sum.x += a.x * z_sq.x - a.y * z_sq.y;
+                            sum.y += a.x * z_sq.y + a.y * z_sq.x;
+                        }
+                        new_Z[row] = sum;
+                        norm_sq += sum.x*sum.x + sum.y*sum.y;
+                    }
+                    for(int j=0; j<ndim; j++) Z[j] = new_Z[j];
+                    if (norm_sq > escape_r2) return;
                 }
 
                 float phase = atan(c_im, c_re);
@@ -407,15 +424,28 @@ pub fn generate_points_gpu(context: &Context, params: &BrotParams, mat: &DMatrix
                 vec4 color = cool(tc);
 
                 for (int i = 0; i < keep; i++) {
-                    float z_re2 = z_re * z_re - z_im * z_im + c_re;
-                    float z_im2 = 2.0 * z_re * z_im + c_im;
-                    z_re = z_re2;
-                    z_im = z_im2;
-
-                    if (z_re * z_re + z_im * z_im > escape_r2) return;
+                    vec2 Z_sq[10];
+                    for(int j=0; j<ndim; j++) {
+                        Z_sq[j] = vec2(Z[j].x*Z[j].x - Z[j].y*Z[j].y, 2.0*Z[j].x*Z[j].y);
+                    }
+                    vec2 new_Z[10];
+                    float norm_sq = 0.0;
+                    for(int row=0; row<ndim; row++) {
+                        vec2 sum = vec2(c_re, c_im);
+                        for(int col=0; col<ndim; col++) {
+                            vec2 a = matrix[row * ndim + col];
+                            vec2 z_sq = Z_sq[col];
+                            sum.x += a.x * z_sq.x - a.y * z_sq.y;
+                            sum.y += a.x * z_sq.y + a.y * z_sq.x;
+                        }
+                        new_Z[row] = sum;
+                        norm_sq += sum.x*sum.x + sum.y*sum.y;
+                    }
+                    for(int j=0; j<ndim; j++) Z[j] = new_Z[j];
+                    if (norm_sq > escape_r2) return;
 
                     uint out_idx = atomicCounterIncrement(counter);
-                    points[out_idx].pos = vec4(c_re, c_im, z_re, 0.0);
+                    points[out_idx].pos = vec4(c_re, c_im, Z[0].x, 0.0);
                     points[out_idx].color = color;
                 }
             }
