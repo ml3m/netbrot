@@ -63,6 +63,9 @@ pub struct App {
     pub texture: Option<TextureHandle>,
     pub resolution: usize,
     pub iterations: usize,
+    pub iter_range_start: usize,
+    pub iter_range_end: usize,
+    pub iter_slider_idx: usize,
     pub escape_radius: f64,
     pub bbox: (f64, f64, f64, f64),
     pub render_bbox: (f64, f64, f64, f64),
@@ -136,6 +139,9 @@ impl App {
             texture: None,
             resolution: 500,
             iterations: 100,
+            iter_range_start: 1,
+            iter_range_end: 200,
+            iter_slider_idx: 25,
             escape_radius: 4.0,
             bbox: (-2.5, 1.5, -1.5, 1.5),
             render_bbox: (-2.5, 1.5, -1.5, 1.5),
@@ -501,7 +507,50 @@ impl App {
         });
         
         ui.add(egui::DragValue::new(&mut self.escape_radius).speed(0.1).prefix("Escape Radius: "));
-        ui.add(egui::DragValue::new(&mut self.iterations).speed(1).prefix("Max Iterations: "));
+        
+        let mut iterations_changed = false;
+        if ui.add(egui::DragValue::new(&mut self.iterations).speed(1).prefix("Max Iterations: ")).changed() {
+            iterations_changed = true;
+            let range = self.iter_range_end.saturating_sub(self.iter_range_start);
+            if range > 0 {
+                let clamped = self.iterations.clamp(self.iter_range_start, self.iter_range_end);
+                self.iter_slider_idx = ((clamped - self.iter_range_start) * 50) / range;
+            } else {
+                self.iter_slider_idx = 0;
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Slider Range:");
+            let r1 = ui.add(egui::DragValue::new(&mut self.iter_range_start).speed(1).prefix("Min: "));
+            let r2 = ui.add(egui::DragValue::new(&mut self.iter_range_end).speed(1).prefix("Max: "));
+            
+            if r1.changed() || r2.changed() {
+                if self.iter_range_start > self.iter_range_end {
+                    std::mem::swap(&mut self.iter_range_start, &mut self.iter_range_end);
+                }
+                let range = self.iter_range_end.saturating_sub(self.iter_range_start);
+                if range > 0 {
+                    let clamped = self.iterations.clamp(self.iter_range_start, self.iter_range_end);
+                    self.iter_slider_idx = ((clamped - self.iter_range_start) * 50) / range;
+                } else {
+                    self.iter_slider_idx = 0;
+                }
+            }
+        });
+
+        if ui.add(egui::Slider::new(&mut self.iter_slider_idx, 0..=50).text("Slide Iterations")).changed() {
+            iterations_changed = true;
+            let range = self.iter_range_end.saturating_sub(self.iter_range_start);
+            self.iterations = self.iter_range_start + (self.iter_slider_idx * range) / 50;
+        }
+
+        if iterations_changed {
+            self.netbrot.maxit = self.iterations;
+            let ctx = ui.ctx().clone();
+            self.generate_2d(&ctx);
+        }
+
         ui.add(egui::DragValue::new(&mut self.resolution).speed(10).prefix("Resolution: "));
         
         ui.separator();
@@ -1018,7 +1067,11 @@ impl App {
         
         if let Ok(file) = File::open(path) {
             if let Ok(exhibit) = serde_json::from_reader::<_, Exhibit>(file) {
-                self.netbrot = Netbrot::new(&exhibit.mat, 200, exhibit.escape_radius);
+                self.iterations = 200;
+                self.iter_range_start = 1;
+                self.iter_range_end = 400;
+                self.iter_slider_idx = 25;
+                self.netbrot = Netbrot::new(&exhibit.mat, self.iterations, exhibit.escape_radius);
                 self.bbox = (exhibit.upper_left.re, exhibit.lower_right.re, exhibit.lower_right.im, exhibit.upper_left.im);
                 self.points_generated = false;
                 
